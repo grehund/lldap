@@ -286,4 +286,43 @@ impl HostService {
             "Could not validate token",
         )
     }
+
+    pub fn check_password_haveibeenpwned(
+        password: &str,
+        callback: Callback<Result<Option<bool>>>,
+    ) -> Result<FetchTask> {
+        use lldap_auth::password_reset::*;
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(password);
+        let password_hash = format!("{:X}", hasher.finalize());
+        let hash_prefix = password_hash[0..5].to_string();
+        let parse_response =
+            callback.reform(move |response: Result<PasswordHashList>| match response {
+                Ok(r) => {
+                    for PasswordHashCount { hash, count } in r.hashes {
+                        if password_hash[5..] == hash && count != 0 {
+                            return Ok(Some(true));
+                        }
+                    }
+                    Ok(Some(false))
+                }
+                Err(e) => {
+                    if e.to_string().contains("[501]:") {
+                        // Unimplemented, no API key.
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
+            });
+        call_server_json_with_error_message(
+            "/auth/password/check",
+            &PasswordPartialHash {
+                partial_hash: hash_prefix,
+            },
+            parse_response,
+            "Could not validate token",
+        )
+    }
 }

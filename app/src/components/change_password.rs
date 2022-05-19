@@ -1,4 +1,5 @@
 use crate::{
+    components::password_field::PasswordField,
     components::router::{AppRoute, NavButton},
     infra::{
         api::HostService,
@@ -249,13 +250,12 @@ impl Component for ChangePasswordForm {
                   {"New password*:"}
                 </label>
                 <div class="col-sm-10">
-                  <Field
+                  <PasswordField<FormModel>
                     form=&self.form
                     field_name="password"
                     class="form-control"
                     class_invalid="is-invalid has-error"
                     class_valid="has-success"
-                    autocomplete="new-password"
                     oninput=self.common.callback(|_| Msg::FormUpdate) />
                   <div class="invalid-feedback">
                     {&self.form.field_message("password")}

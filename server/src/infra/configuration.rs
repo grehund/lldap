@@ -89,6 +89,8 @@ pub struct Configuration {
     pub ldaps_options: LdapsOptions,
     #[builder(default = r#"String::from("http://localhost")"#)]
     pub http_url: String,
+    #[builder(default)]
+    pub hipb_api_key: String,
     #[serde(skip)]
     #[builder(field(private), default = "None")]
     server_setup: Option<ServerSetup>,
@@ -173,6 +175,10 @@ impl ConfigOverrider for RunOpts {
 
         if let Some(url) = self.http_url.as_ref() {
             config.http_url = url.to_string();
+        }
+
+        if let Some(api_key) = self.hipb_api_key.as_ref() {
+            config.hipb_api_key = api_key.to_string();
         }
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);

@@ -102,6 +102,24 @@ pub mod password_reset {
         pub user_id: String,
         pub token: String,
     }
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct PasswordPartialHash {
+        // First 5 hex digits of the sha-1 hash of the password to check.
+        #[serde(rename = "partialHash")]
+        pub partial_hash: String,
+    }
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct PasswordHashCount {
+        pub hash: String,
+        pub count: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct PasswordHashList {
+        pub hashes: Vec<PasswordHashCount>,
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
