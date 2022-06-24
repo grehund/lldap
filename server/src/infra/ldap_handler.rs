@@ -1,8 +1,8 @@
 use crate::{
     domain::{
         handler::{
-            BackendHandler, BindRequest, Group, GroupIdAndName, GroupRequestFilter, LoginHandler,
-            User, UserId, UserRequestFilter,
+            BackendHandler, BindRequest, Group, GroupDetails, GroupRequestFilter, LoginHandler,
+            User, UserId, UserRequestFilter, Uuid,
         },
         opaque_handler::OpaqueHandler,
     },
@@ -148,21 +148,12 @@ fn get_user_id_from_distinguished_name(
     }
 }
 
-fn get_hash_as_uuid(dn: &str, creation_date: &chrono::DateTime<chrono::Utc>) -> String {
-    use uuid::Uuid;
-    Uuid::new_v3(
-        &Uuid::NAMESPACE_X500,
-        &[dn.as_bytes(), creation_date.to_rfc3339().as_bytes()].concat(),
-    )
-    .to_string()
-}
-
 fn get_user_attribute(
     user: &User,
     attribute: &str,
     dn: &str,
     base_dn_str: &str,
-    groups: Option<&[GroupIdAndName]>,
+    groups: Option<&[GroupDetails]>,
     ignored_user_attributes: &[String],
 ) -> Result<Option<Vec<String>>> {
     let attribute = attribute.to_ascii_lowercase();
@@ -175,14 +166,19 @@ fn get_user_attribute(
         ],
         "dn" | "distinguishedname" => vec![dn.to_string()],
         "uid" => vec![user.user_id.to_string()],
-        "entryuuid" => vec![get_hash_as_uuid(dn, &user.creation_date)],
+        "entryuuid" => vec![user.uuid.to_string()],
         "mail" => vec![user.email.clone()],
         "givenname" => vec![user.first_name.clone()],
         "sn" => vec![user.last_name.clone()],
         "memberof" => groups
             .into_iter()
             .flatten()
-            .map(|id_and_name| format!("uid={},ou=groups,{}", &id_and_name.1, base_dn_str))
+            .map(|id_and_name| {
+                format!(
+                    "uid={},ou=groups,{}",
+                    &id_and_name.display_name, base_dn_str
+                )
+            })
             .collect(),
         "cn" | "displayname" => vec![user.display_name.clone()],
         "createtimestamp" | "modifytimestamp" => vec![user.creation_date.to_rfc3339()],
@@ -243,7 +239,7 @@ fn make_ldap_search_user_result_entry(
     user: User,
     base_dn_str: &str,
     attributes: &[String],
-    groups: Option<&[GroupIdAndName]>,
+    groups: Option<&[GroupDetails]>,
     ignored_user_attributes: &[String],
 ) -> Result<LdapSearchResultEntry> {
     let dn = format!("uid={},ou=people,{}", user.user_id.as_str(), base_dn_str);
@@ -288,6 +284,7 @@ fn get_group_attribute(
             group.display_name, base_dn_str
         )],
         "cn" | "uid" => vec![group.display_name.clone()],
+        "entryuuid" => vec![group.uuid.to_string()],
         "member" | "uniquemember" => group
             .users
             .iter()
@@ -509,7 +506,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 let is_in_group = |name| {
                     user_groups
                         .as_ref()
-                        .map(|groups| groups.iter().any(|g| g.1 == name))
+                        .map(|groups| groups.iter().any(|g| g.display_name == name))
                         .unwrap_or(false)
                 };
                 self.user_info = Some((
@@ -871,24 +868,25 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                         ))))
                     }
                 } else {
-                    let mapped_field = map_field(field);
-                    if mapped_field.is_ok()
-                        && (mapped_field.as_ref().unwrap() == "display_name"
-                            || mapped_field.as_ref().unwrap() == "user_id")
-                    {
-                        Ok(GroupRequestFilter::DisplayName(value.clone()))
-                    } else {
-                        if !self.ignored_group_attributes.contains(field) {
-                            warn!(
-                                r#"Ignoring unknown group attribute "{:?}" in filter.\n\
-                                To disable this warning, add it to "ignored_group_attributes" in the config."#,
-                                field
-                            );
+                    if let Ok(field) = map_field(field) {
+                        if field == "display_name" || field == "user_id" {
+                            return Ok(GroupRequestFilter::DisplayName(value.clone()));
+                        } else if field == "uuid" {
+                            return Ok(GroupRequestFilter::Uuid(Uuid::from(
+                                &uuid::Uuid::parse_str(value)?,
+                            )));
                         }
-                        Ok(GroupRequestFilter::Not(Box::new(GroupRequestFilter::And(
-                            vec![],
-                        ))))
                     }
+                    if !self.ignored_group_attributes.contains(field) {
+                        warn!(
+                            r#"Ignoring unknown group attribute "{:?}" in filter.\n\
+                                To disable this warning, add it to "ignored_group_attributes" in the config."#,
+                            field
+                        );
+                    }
+                    Ok(GroupRequestFilter::Not(Box::new(GroupRequestFilter::And(
+                        vec![],
+                    ))))
                 }
             }
             LdapFilter::And(filters) => Ok(GroupRequestFilter::And(
@@ -1002,6 +1000,7 @@ mod tests {
     use super::*;
     use crate::domain::{error::Result, handler::*, opaque_handler::*};
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use ldap3_server::proto::{LdapDerefAliases, LdapSearchScope};
     use mockall::predicate::eq;
     use std::collections::HashSet;
@@ -1021,8 +1020,8 @@ mod tests {
             async fn list_users(&self, filters: Option<UserRequestFilter>, get_groups: bool) -> Result<Vec<UserAndGroups>>;
             async fn list_groups(&self, filters: Option<GroupRequestFilter>) -> Result<Vec<Group>>;
             async fn get_user_details(&self, user_id: &UserId) -> Result<User>;
-            async fn get_group_details(&self, group_id: GroupId) -> Result<GroupIdAndName>;
-            async fn get_user_groups(&self, user: &UserId) -> Result<HashSet<GroupIdAndName>>;
+            async fn get_group_details(&self, group_id: GroupId) -> Result<GroupDetails>;
+            async fn get_user_groups(&self, user: &UserId) -> Result<HashSet<GroupDetails>>;
             async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
             async fn update_user(&self, request: UpdateUserRequest) -> Result<()>;
             async fn update_group(&self, request: UpdateGroupRequest) -> Result<()>;
@@ -1089,7 +1088,12 @@ mod tests {
             .with(eq(UserId::new("test")))
             .return_once(|_| {
                 let mut set = HashSet::new();
-                set.insert(GroupIdAndName(GroupId(42), group));
+                set.insert(GroupDetails {
+                    group_id: GroupId(42),
+                    display_name: group,
+                    creation_date: chrono::Utc.timestamp(42, 42),
+                    uuid: "a1a2a3a4b1b2c1c2d1d2d3d4d5d6d7d8".into(),
+                });
                 Ok(set)
             });
         let mut ldap_handler =
@@ -1165,7 +1169,12 @@ mod tests {
             .with(eq(UserId::new("test")))
             .return_once(|_| {
                 let mut set = HashSet::new();
-                set.insert(GroupIdAndName(GroupId(42), "lldap_admin".to_string()));
+                set.insert(GroupDetails {
+                    group_id: GroupId(42),
+                    display_name: "lldap_admin".to_string(),
+                    creation_date: chrono::Utc.timestamp(42, 42),
+                    uuid: "a1a2a3a4b1b2c1c2d1d2d3d4d5d6d7d8".into(),
+                });
                 Ok(set)
             });
         let mut ldap_handler =
@@ -1247,7 +1256,12 @@ mod tests {
                         user_id: UserId::new("bob"),
                         ..Default::default()
                     },
-                    groups: Some(vec![GroupIdAndName(GroupId(42), "rockstars".to_string())]),
+                    groups: Some(vec![GroupDetails {
+                        group_id: GroupId(42),
+                        display_name: "rockstars".to_string(),
+                        creation_date: chrono::Utc.timestamp(42, 42),
+                        uuid: "a1a2a3a4b1b2c1c2d1d2d3d4d5d6d7d8".into(),
+                    }]),
                 }])
             });
         let mut ldap_handler = setup_bound_readonly_handler(mock).await;
@@ -1396,6 +1410,7 @@ mod tests {
                         display_name: "Bôb Böbberson".to_string(),
                         first_name: "Bôb".to_string(),
                         last_name: "Böbberson".to_string(),
+                        uuid: "698e1d5f-7a40-3151-8745-b9b8a37839da".into(),
                         ..Default::default()
                     },
                     groups: None,
@@ -1407,6 +1422,7 @@ mod tests {
                         display_name: "Jimminy Cricket".to_string(),
                         first_name: "Jim".to_string(),
                         last_name: "Cricket".to_string(),
+                        uuid: "04ac75e0-2900-3e21-926c-2f732c26b3fc".into(),
                         creation_date: Utc.ymd(2014, 7, 8).and_hms(9, 10, 11),
                     },
                     groups: None,
@@ -1539,12 +1555,16 @@ mod tests {
                     Group {
                         id: GroupId(1),
                         display_name: "group_1".to_string(),
+                        creation_date: chrono::Utc.timestamp(42, 42),
                         users: vec![UserId::new("bob"), UserId::new("john")],
+                        uuid: "abc".into(),
                     },
                     Group {
                         id: GroupId(3),
                         display_name: "BestGroup".to_string(),
+                        creation_date: chrono::Utc.timestamp(42, 42),
                         users: vec![UserId::new("john")],
+                        uuid: "abc".into(),
                     },
                 ])
             });
@@ -1552,7 +1572,7 @@ mod tests {
         let request = make_search_request(
             "ou=groups,dc=example,dc=cOm",
             LdapFilter::And(vec![]),
-            vec!["objectClass", "dn", "cn", "uniqueMember"],
+            vec!["objectClass", "dn", "cn", "uniqueMember", "entryUuid"],
         );
         assert_eq!(
             ldap_handler.do_search_or_dse(&request).await,
@@ -1579,6 +1599,10 @@ mod tests {
                                 "uid=john,ou=people,dc=example,dc=com".to_string(),
                             ]
                         },
+                        LdapPartialAttribute {
+                            atype: "entryUuid".to_string(),
+                            vals: vec!["abc".to_string()],
+                        },
                     ],
                 }),
                 LdapOp::SearchResultEntry(LdapSearchResultEntry {
@@ -1599,6 +1623,10 @@ mod tests {
                         LdapPartialAttribute {
                             atype: "uniqueMember".to_string(),
                             vals: vec!["uid=john,ou=people,dc=example,dc=com".to_string()]
+                        },
+                        LdapPartialAttribute {
+                            atype: "entryUuid".to_string(),
+                            vals: vec!["abc".to_string()],
                         },
                     ],
                 }),
@@ -1628,7 +1656,9 @@ mod tests {
                 Ok(vec![Group {
                     display_name: "group_1".to_string(),
                     id: GroupId(1),
+                    creation_date: chrono::Utc.timestamp(42, 42),
                     users: vec![],
+                    uuid: "abc".into(),
                 }])
             });
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
@@ -1677,7 +1707,9 @@ mod tests {
                 Ok(vec![Group {
                     display_name: "group_1".to_string(),
                     id: GroupId(1),
+                    creation_date: chrono::Utc.timestamp(42, 42),
                     users: vec![],
+                    uuid: "abc".into(),
                 }])
             });
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
@@ -1951,7 +1983,9 @@ mod tests {
                 Ok(vec![Group {
                     id: GroupId(1),
                     display_name: "group_1".to_string(),
+                    creation_date: chrono::Utc.timestamp(42, 42),
                     users: vec![UserId::new("bob"), UserId::new("john")],
+                    uuid: "abc".into(),
                 }])
             });
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
@@ -2008,7 +2042,6 @@ mod tests {
     }
     #[tokio::test]
     async fn test_search_wildcards() {
-        use chrono::TimeZone;
         let mut mock = MockTestBackendHandler::new();
 
         mock.expect_list_users().returning(|_, _| {
@@ -2030,7 +2063,9 @@ mod tests {
                 Ok(vec![Group {
                     id: GroupId(1),
                     display_name: "group_1".to_string(),
+                    creation_date: chrono::Utc.timestamp(42, 42),
                     users: vec![UserId::new("bob"), UserId::new("john")],
+                    uuid: "abc".into(),
                 }])
             });
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
@@ -2332,18 +2367,6 @@ mod tests {
                 root_dse_response("dc=example,dc=com"),
                 make_search_success()
             ]
-        );
-    }
-
-    #[test]
-    fn test_hash_time() {
-        use chrono::prelude::*;
-        let user_id = "bob";
-        let date1 = Utc.ymd(2014, 7, 8).and_hms(9, 10, 11);
-        let date2 = Utc.ymd(2014, 7, 8).and_hms(9, 10, 12);
-        assert_ne!(
-            get_hash_as_uuid(user_id, &date1),
-            get_hash_as_uuid(user_id, &date2)
         );
     }
 }
